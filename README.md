@@ -2,12 +2,12 @@
 
 A read-only Go CLI starter for exploring Huawei server management controllers
 through the Redfish API. It uses Go's standard library and does not assume that
-every server or iBMC firmware exposes the same optional resources.
+every server or BMC firmware exposes the same optional resources.
 
 ## Requirements
 
 - Go 1.24 or later
-- A Huawei server/iBMC reachable over HTTP(S) with a Redfish account
+- A Huawei server/BMC reachable over HTTP(S) with a Redfish account
 
 ## Build
 
