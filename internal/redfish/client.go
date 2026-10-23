@@ -65,45 +65,50 @@ func NewClient(config Config) (*Client, error) {
 }
 
 func (c *Client) Get(ctx context.Context, resourcePath string) (json.RawMessage, error) {
+	body, _, err := c.GetWithETag(ctx, resourcePath)
+	return body, err
+}
+
+func (c *Client) GetWithETag(ctx context.Context, resourcePath string) (json.RawMessage, string, error) {
 	resourceURL, err := c.resourceURL(resourcePath)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, resourceURL.String(), nil)
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return nil, "", fmt.Errorf("create request: %w", err)
 	}
 	request.SetBasicAuth(c.username, c.password)
 	request.Header.Set("Accept", "application/json")
 
 	response, err := c.http.Do(request)
 	if err != nil {
-		return nil, fmt.Errorf("GET %s: %w", resourcePath, err)
+		return nil, "", fmt.Errorf("GET %s: %w", resourcePath, err)
 	}
 	defer response.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseSize+1))
 	if err != nil {
-		return nil, fmt.Errorf("read response from %s: %w", resourcePath, err)
+		return nil, "", fmt.Errorf("read response from %s: %w", resourcePath, err)
 	}
 	if len(body) > maxResponseSize {
-		return nil, fmt.Errorf("response from %s exceeds %d bytes", resourcePath, maxResponseSize)
+		return nil, "", fmt.Errorf("response from %s exceeds %d bytes", resourcePath, maxResponseSize)
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		detail := strings.TrimSpace(string(body))
 		if len(detail) > 512 {
 			detail = detail[:512] + "..."
 		}
-		return nil, fmt.Errorf("GET %s returned HTTP %s: %s", resourcePath, response.Status, detail)
+		return nil, "", fmt.Errorf("GET %s returned HTTP %s: %s", resourcePath, response.Status, detail)
 	}
 	if !json.Valid(body) {
-		return nil, fmt.Errorf("GET %s returned invalid JSON", resourcePath)
+		return nil, "", fmt.Errorf("GET %s returned invalid JSON", resourcePath)
 	}
-	return json.RawMessage(body), nil
+	return json.RawMessage(body), response.Header.Get("ETag"), nil
 }
 
-func (c *Client) Patch(ctx context.Context, resourcePath string, body []byte) error {
+func (c *Client) Patch(ctx context.Context, resourcePath string, body []byte, etag string) error {
 	resourceURL, err := c.resourceURL(resourcePath)
 	if err != nil {
 		return err
@@ -116,6 +121,9 @@ func (c *Client) Patch(ctx context.Context, resourcePath string, body []byte) er
 	request.SetBasicAuth(c.username, c.password)
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("Content-Type", "application/json")
+	if etag != "" {
+		request.Header.Set("If-Match", etag)
+	}
 
 	response, err := c.http.Do(request)
 	if err != nil {
@@ -134,6 +142,12 @@ func (c *Client) Patch(ctx context.Context, resourcePath string, body []byte) er
 		detail := strings.TrimSpace(string(responseBody))
 		if len(detail) > 512 {
 			detail = detail[:512] + "..."
+		}
+		if response.StatusCode == http.StatusPreconditionFailed {
+			if etag == "" {
+				return fmt.Errorf("PATCH %s returned HTTP %s: no ETag was available for If-Match; the BMC may require a resource version: %s", resourcePath, response.Status, detail)
+			}
+			return fmt.Errorf("PATCH %s returned HTTP %s: the BMC rejected If-Match; the resource may have changed; read the configuration and rerun the command after reviewing it: %s", resourcePath, response.Status, detail)
 		}
 		return fmt.Errorf("PATCH %s returned HTTP %s: %s", resourcePath, response.Status, detail)
 	}

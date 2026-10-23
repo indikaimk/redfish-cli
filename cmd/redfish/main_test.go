@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"redfish-tool/internal/redfish"
@@ -152,6 +153,7 @@ func TestExecuteSyslogPatchesOnlySelectedServerAndPreservesOtherSlots(t *testing
 func TestExecuteSyslogDryRunDoesNotPatch(t *testing.T) {
 	var patchCount int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `W/"syslog-1"`)
 		if r.Method == http.MethodPatch {
 			patchCount++
 			return
@@ -175,6 +177,102 @@ func TestExecuteSyslogDryRunDoesNotPatch(t *testing.T) {
 	}
 	if patchCount != 0 {
 		t.Fatalf("dry run unexpectedly sent %d PATCH request(s)", patchCount)
+	}
+}
+
+func TestExecuteSyslogConditionalPatch(t *testing.T) {
+	tests := []struct {
+		name       string
+		headerETag string
+		bodyETag   string
+		wantMatch  string
+		status     int
+		wantError  string
+	}{
+		{name: "header", headerETag: `"version-1"`, wantMatch: `"version-1"`, status: http.StatusNoContent},
+		{name: "weak header unchanged", headerETag: `W/"version-1"`, wantMatch: `W/"version-1"`, status: http.StatusOK},
+		{name: "body fallback", bodyETag: `W/"version-2"`, wantMatch: `W/"version-2"`, status: http.StatusNoContent},
+		{name: "header takes precedence", headerETag: `"header-version"`, bodyETag: `"body-version"`, wantMatch: `"header-version"`, status: http.StatusNoContent},
+		{name: "no etag supported", status: http.StatusNoContent},
+		{name: "stale version", headerETag: `"old"`, wantMatch: `"old"`, status: http.StatusPreconditionFailed, wantError: "the BMC rejected If-Match"},
+		{name: "etag required but missing", status: http.StatusPreconditionFailed, wantError: "no ETag was available"},
+		{name: "other error preserved", headerETag: `"version-1"`, wantMatch: `"version-1"`, status: http.StatusBadRequest, wantError: "invalid configuration"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			getCount, patchCount := 0, 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/redfish/v1/Managers/Blade6/SyslogService" {
+					t.Errorf("unexpected resource: %s", r.URL.Path)
+					http.NotFound(w, r)
+					return
+				}
+				username, password, ok := r.BasicAuth()
+				if !ok || username != "operator" || password != "secret" {
+					t.Error("missing or incorrect Basic authentication")
+				}
+				switch r.Method {
+				case http.MethodGet:
+					getCount++
+					if test.headerETag != "" {
+						w.Header().Set("ETag", test.headerETag)
+					}
+					if err := json.NewEncoder(w).Encode(map[string]any{
+						"@odata.etag": test.bodyETag,
+						"SyslogServers": []map[string]any{
+							{"MemberId": "0", "Enabled": false, "Address": "", "Port": 0},
+						},
+					}); err != nil {
+						t.Errorf("encode service: %v", err)
+					}
+				case http.MethodPatch:
+					patchCount++
+					if got := r.Header.Get("If-Match"); got != test.wantMatch {
+						t.Errorf("If-Match = %q, want %q", got, test.wantMatch)
+						w.WriteHeader(http.StatusPreconditionFailed)
+						return
+					}
+					var payload map[string]json.RawMessage
+					if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+						t.Errorf("decode PATCH: %v", err)
+					}
+					if _, exists := payload["@odata.etag"]; exists {
+						t.Error("ETag must not be sent as a writable property")
+					}
+					w.WriteHeader(test.status)
+					if test.status == http.StatusBadRequest {
+						_, _ = w.Write([]byte(`{"error":"invalid configuration"}`))
+					}
+				default:
+					t.Errorf("unexpected method: %s", r.Method)
+					w.WriteHeader(http.StatusMethodNotAllowed)
+				}
+			}))
+			defer server.Close()
+
+			client, err := redfish.NewClient(redfish.Config{
+				Endpoint: server.URL, Username: "operator", Password: "secret",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = executeSyslog(context.Background(), client, syslogOptions{
+				manager: "Blade6", serverID: "0", address: "172.26.103.27",
+				port: 6514, enable: true, apply: true,
+			})
+			wantGets := 2
+			if test.wantError != "" {
+				wantGets = 1
+				if err == nil || !strings.Contains(err.Error(), test.wantError) {
+					t.Fatalf("error = %v, want %q", err, test.wantError)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if getCount != wantGets || patchCount != 1 {
+				t.Fatalf("got %d GETs and %d PATCHes, want %d GETs and one PATCH (no retries)", getCount, patchCount, wantGets)
+			}
+		})
 	}
 }
 

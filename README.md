@@ -15,6 +15,12 @@ every server or BMC firmware exposes the same optional resources.
 go build -o redfish ./cmd/redfish
 ```
 
+On Windows PowerShell, build with:
+
+```powershell
+go build -o redfish.exe ./cmd/redfish
+```
+
 ## Credentials
 
 Provide credentials through environment variables. The password is intentionally
@@ -84,6 +90,14 @@ command reads the current configuration first and preserves the other server
 slots. Omitted protocol, message format, and log types are left unchanged.
 Slots are selected by `MemberId` (0-3); `--disable` disables only the selected
 slot. `--enable` requires an address and port.
+
+When the BMC supplies an `ETag` response header (or `@odata.etag` in the
+resource), the command sends that exact version in the PATCH `If-Match` header.
+This supports BMCs that require conditional updates and helps prevent overwriting
+concurrent configuration changes. HTTP 412 means the BMC rejected a precondition;
+review the current configuration before rerunning the command. The command does
+not retry automatically or force an overwrite. If no ETag is provided, the PATCH
+is sent without `If-Match`; a BMC requiring it may still reject the request.
 
 ```powershell
 .\redfish.exe syslog --endpoint https://192.0.2.10 `

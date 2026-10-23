@@ -40,6 +40,7 @@ type collection struct {
 }
 
 type syslogService struct {
+	ETag          string                       `json:"@odata.etag"`
 	SyslogServers []map[string]json.RawMessage `json:"SyslogServers"`
 }
 
@@ -193,7 +194,7 @@ func validateSyslogOptions(opts syslogOptions) error {
 
 func executeSyslog(ctx context.Context, client *redfish.Client, opts syslogOptions) error {
 	resourcePath := "/redfish/v1/Managers/" + opts.manager + "/SyslogService"
-	data, err := client.Get(ctx, resourcePath)
+	data, etag, err := client.GetWithETag(ctx, resourcePath)
 	if err != nil {
 		return err
 	}
@@ -201,6 +202,9 @@ func executeSyslog(ctx context.Context, client *redfish.Client, opts syslogOptio
 	var service syslogService
 	if err := json.Unmarshal(data, &service); err != nil {
 		return fmt.Errorf("decode syslog service: %w", err)
+	}
+	if etag == "" {
+		etag = service.ETag
 	}
 	if service.SyslogServers == nil {
 		return fmt.Errorf("syslog service does not contain a SyslogServers array")
@@ -258,7 +262,7 @@ func executeSyslog(ctx context.Context, client *redfish.Client, opts syslogOptio
 		return printJSON(encoded)
 	}
 
-	if err := client.Patch(ctx, resourcePath, encoded); err != nil {
+	if err := client.Patch(ctx, resourcePath, encoded, etag); err != nil {
 		return err
 	}
 	updated, err := client.Get(ctx, resourcePath)
