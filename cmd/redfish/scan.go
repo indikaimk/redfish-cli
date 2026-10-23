@@ -14,6 +14,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -41,20 +42,28 @@ func runScan(args []string) error {
 	flags.SetOutput(os.Stderr)
 	target := flags.String("target", "", "IPv4 CIDR or inclusive start-end range (maximum 1024 addresses)")
 	output := flags.String("output", "", "new YAML inventory file (required; existing files are not overwritten)")
+	failuresOutput := flags.String("failures-output", "", "new YAML failures file (default: inventory basename + .failures.yaml)")
 	insecure := flags.Bool("insecure", false, "skip TLS certificate verification (not recommended)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 || *output == "" {
-		return fmt.Errorf("usage: redfish scan --target CIDR_OR_START-END --output inventory.yaml [--insecure]")
+		return fmt.Errorf("usage: redfish scan --target CIDR_OR_START-END --output inventory.yaml [--failures-output failures.yaml] [--insecure]")
 	}
 	addresses, err := scanAddresses(*target)
 	if err != nil {
 		return err
 	}
+	if *failuresOutput == "" {
+		*failuresOutput = strings.TrimSuffix(*output, filepath.Ext(*output)) + ".failures.yaml"
+	}
 	file, err := os.OpenFile(*output, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return fmt.Errorf("create inventory: %w", err)
+	}
+	failuresFile, err := os.OpenFile(*failuresOutput, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return errors.Join(fmt.Errorf("create failures file: %w", err), file.Close(), os.Remove(*output))
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -62,13 +71,11 @@ func runScan(args []string) error {
 	results := scanHosts(ctx, addresses, func(ctx context.Context, address netip.Addr) scanResult {
 		return probeHost(ctx, address.String(), "https://"+address.String(), *insecure)
 	})
-	writeErr := writeInventory(file, results)
-	closeErr := file.Close()
-	if writeErr != nil {
-		return fmt.Errorf("write inventory %s (file may be incomplete): %w", *output, writeErr)
-	}
-	if closeErr != nil {
-		return fmt.Errorf("close inventory %s: %w", *output, closeErr)
+	inventoryErr := writeInventory(file, results, "hosts")
+	failuresErr := writeInventory(failuresFile, results, "failures")
+	saveErr := errors.Join(inventoryErr, failuresErr, file.Close(), failuresFile.Close())
+	if saveErr != nil {
+		return fmt.Errorf("save inventory %s and failures %s (files may be incomplete): %w", *output, *failuresOutput, saveErr)
 	}
 	found := 0
 	for _, result := range results {
@@ -77,13 +84,11 @@ func runScan(args []string) error {
 			if result.UUID == "" || result.ProductName == "" {
 				fmt.Fprintf(os.Stderr, "%s: discovered, but UUID or ProductName is not advertised\n", result.IP)
 			}
-		} else {
-			fmt.Fprintf(os.Stderr, "%s: %s: %s\n", result.IP, result.Status, result.Error)
 		}
 	}
-	fmt.Fprintf(os.Stderr, "Inventory saved to %s: %d Redfish hosts, %d other results.\n", *output, found, len(results)-found)
+	fmt.Fprintf(os.Stderr, "Inventory saved to %s: %d Redfish hosts. Failures saved to %s: %d results.\n", *output, found, *failuresOutput, len(results)-found)
 	if ctx.Err() != nil {
-		return fmt.Errorf("scan interrupted; inventory includes cancelled targets: %w", ctx.Err())
+		return fmt.Errorf("scan interrupted; failures file includes cancelled targets: %w", ctx.Err())
 	}
 	return nil
 }
@@ -221,47 +226,48 @@ func scanErrorStatus(err error) string {
 	}
 }
 
-func writeInventory(w io.Writer, results []scanResult) error {
+func writeInventory(w io.Writer, results []scanResult, group string) error {
+	if group != "hosts" && group != "failures" {
+		return fmt.Errorf("invalid scan result group %q", group)
+	}
 	if _, err := fmt.Fprintln(w, "version: 1"); err != nil {
 		return err
 	}
-	for _, group := range []string{"hosts", "failures"} {
-		var entries []scanResult
-		for _, result := range results {
-			if (result.Status == "discovered") == (group == "hosts") {
-				entries = append(entries, result)
-			}
+	var entries []scanResult
+	for _, result := range results {
+		if (result.Status == "discovered") == (group == "hosts") {
+			entries = append(entries, result)
 		}
-		if len(entries) == 0 {
-			if _, err := fmt.Fprintf(w, "%s: []\n", group); err != nil {
-				return err
-			}
-			continue
-		}
-		if _, err := fmt.Fprintf(w, "%s:\n", group); err != nil {
+	}
+	if len(entries) == 0 {
+		if _, err := fmt.Fprintf(w, "%s: []\n", group); err != nil {
 			return err
 		}
-		for _, result := range entries {
-			fields := []struct{ name, value string }{
-				{"ip", result.IP}, {"endpoint", result.Endpoint}, {"status", result.Status},
+		return nil
+	}
+	if _, err := fmt.Fprintf(w, "%s:\n", group); err != nil {
+		return err
+	}
+	for _, result := range entries {
+		fields := []struct{ name, value string }{
+			{"ip", result.IP}, {"endpoint", result.Endpoint}, {"status", result.Status},
+		}
+		if group == "hosts" {
+			fields = append(fields, struct{ name, value string }{"uuid", result.UUID}, struct{ name, value string }{"product_name", result.ProductName})
+		} else {
+			fields = append(fields, struct{ name, value string }{"error", result.Error})
+		}
+		for index, field := range fields {
+			prefix := "    "
+			if index == 0 {
+				prefix = "  - "
 			}
-			if group == "hosts" {
-				fields = append(fields, struct{ name, value string }{"uuid", result.UUID}, struct{ name, value string }{"product_name", result.ProductName})
-			} else {
-				fields = append(fields, struct{ name, value string }{"error", result.Error})
+			if _, err := fmt.Fprintf(w, "%s%s: ", prefix, field.name); err != nil {
+				return err
 			}
-			for index, field := range fields {
-				prefix := "    "
-				if index == 0 {
-					prefix = "  - "
-				}
-				if _, err := fmt.Fprintf(w, "%s%s: ", prefix, field.name); err != nil {
-					return err
-				}
-				// JSON-quoted strings are YAML-compatible and prevent scalar injection.
-				if err := json.NewEncoder(w).Encode(field.value); err != nil {
-					return err
-				}
+			// JSON-quoted strings are YAML-compatible and prevent scalar injection.
+			if err := json.NewEncoder(w).Encode(field.value); err != nil {
+				return err
 			}
 		}
 	}

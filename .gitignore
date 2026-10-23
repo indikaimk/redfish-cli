@@ -7,6 +7,10 @@
 /coverage.out
 /coverage.html
 
+# Keep encrypted credential vaults and their update locks out of source control.
+*.age
+*.age.lock
+
 # Local environment and editor files
 .env
 .env.*

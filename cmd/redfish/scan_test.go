@@ -168,10 +168,11 @@ func TestScanHostsBoundedAndOrdered(t *testing.T) {
 
 func TestWriteInventory(t *testing.T) {
 	var output bytes.Buffer
-	err := writeInventory(&output, []scanResult{
+	results := []scanResult{
 		{IP: "192.0.2.16", Endpoint: "https://192.0.2.16", Status: "discovered", UUID: "id", ProductName: "CH121 V5\ninjected: true"},
 		{IP: "192.0.2.17", Endpoint: "https://192.0.2.17", Status: "authentication_required", Error: `HTTP 401: "protected"`},
-	})
+	}
+	err := writeInventory(&output, results, "hosts")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,6 +183,15 @@ hosts:
     status: "discovered"
     uuid: "id"
     product_name: "CH121 V5\ninjected: true"
+`
+	if output.String() != want {
+		t.Fatalf("unexpected inventory:\n%s", output.String())
+	}
+	output.Reset()
+	if err := writeInventory(&output, results, "failures"); err != nil {
+		t.Fatal(err)
+	}
+	want = `version: 1
 failures:
   - ip: "192.0.2.17"
     endpoint: "https://192.0.2.17"
@@ -192,14 +202,46 @@ failures:
 		t.Fatalf("unexpected inventory:\n%s", output.String())
 	}
 	output.Reset()
-	if err := writeInventory(&output, nil); err != nil {
-		t.Fatal(err)
+	for _, group := range []string{"hosts", "failures"} {
+		output.Reset()
+		if err := writeInventory(&output, nil, group); err != nil {
+			t.Fatal(err)
+		}
+		if output.String() != "version: 1\n"+group+": []\n" {
+			t.Fatalf("unexpected empty output: %s", output.String())
+		}
+		if err := writeInventory(failingWriter{}, results, group); err == nil {
+			t.Fatal("expected write failure")
+		}
 	}
-	if output.String() != "version: 1\nhosts: []\nfailures: []\n" {
-		t.Fatalf("unexpected empty inventory: %s", output.String())
-	}
-	if err := writeInventory(failingWriter{}, nil); err == nil {
-		t.Fatal("expected write failure")
+
+}
+
+func TestRunScanRejectsExistingFailuresFile(t *testing.T) {
+	for _, custom := range []bool{false, true} {
+		t.Run(fmt.Sprint("custom=", custom), func(t *testing.T) {
+			dir := t.TempDir()
+			inventory := filepath.Join(dir, "inventory.yaml")
+			failures := filepath.Join(dir, "inventory.failures.yaml")
+			args := []string{"scan", "--target", "192.0.2.16/32", "--output", inventory}
+			if custom {
+				failures = filepath.Join(dir, "custom.yaml")
+				args = append(args, "--failures-output", failures)
+			}
+			if err := os.WriteFile(failures, []byte("keep"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := run(args); err == nil || !strings.Contains(err.Error(), "create failures file") {
+				t.Fatalf("expected existing failures file rejection: %v", err)
+			}
+			data, err := os.ReadFile(failures)
+			if err != nil || string(data) != "keep" {
+				t.Fatalf("existing failures changed: %q, %v", data, err)
+			}
+			if _, err := os.Stat(inventory); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("empty inventory should be cleaned up before scan: %v", err)
+			}
+		})
 	}
 }
 

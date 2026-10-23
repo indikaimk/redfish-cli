@@ -15,9 +15,12 @@ import (
 const serviceRootPath = "/redfish/v1"
 
 type options struct {
-	endpoint string
-	username string
-	insecure bool
+	endpoint         string
+	username         string
+	insecure         bool
+	credentialsFile  string
+	credentialRef    string
+	usernameExplicit bool
 }
 
 type syslogOptions struct {
@@ -64,6 +67,9 @@ func run(args []string) error {
 	if args[0] == "scan" {
 		return runScan(args[1:])
 	}
+	if args[0] == "credentials" {
+		return runCredentials(args[1:], promptSecret)
+	}
 
 	command := args[0]
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
@@ -72,6 +78,8 @@ func run(args []string) error {
 	flags.StringVar(&opts.endpoint, "endpoint", "", "BMC origin, for example https://192.0.2.10")
 	flags.StringVar(&opts.username, "username", os.Getenv("REDFISH_USERNAME"), "Redfish username (or set REDFISH_USERNAME)")
 	flags.BoolVar(&opts.insecure, "insecure", false, "skip TLS certificate verification (not recommended)")
+	flags.StringVar(&opts.credentialsFile, "credentials-file", "", "age-encrypted credential file")
+	flags.StringVar(&opts.credentialRef, "credential-ref", "", "credential reference bound to this endpoint")
 
 	switch command {
 	case "discover", "systems":
@@ -90,6 +98,7 @@ func run(args []string) error {
 		if err := flags.Parse(args[1:]); err != nil {
 			return err
 		}
+		opts.usernameExplicit = flagsHasUsername(flags)
 		if flags.NArg() != 0 {
 			return usageError()
 		}
@@ -101,6 +110,7 @@ func run(args []string) error {
 		if err := flags.Parse(args[1:]); err != nil {
 			return err
 		}
+		opts.usernameExplicit = flagsHasUsername(flags)
 		if flags.NArg() != 1 {
 			return fmt.Errorf("get requires one resource path, such as /redfish/v1/Systems")
 		}
@@ -112,10 +122,21 @@ func run(args []string) error {
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
+	opts.usernameExplicit = flagsHasUsername(flags)
 	if flags.NArg() != 0 {
 		return usageError()
 	}
 	return execute(opts, command, "", syslogOptions{})
+}
+
+func flagsHasUsername(flags *flag.FlagSet) bool {
+	found := false
+	flags.Visit(func(f *flag.Flag) {
+		if f.Name == "username" {
+			found = true
+		}
+	})
+	return found
 }
 
 func execute(opts options, command, resourcePath string, syslogOpts syslogOptions) error {
@@ -125,16 +146,21 @@ func execute(opts options, command, resourcePath string, syslogOpts syslogOption
 	if strings.HasPrefix(strings.ToLower(opts.endpoint), "http://") {
 		fmt.Fprintln(os.Stderr, "warning: HTTP does not encrypt Redfish credentials or traffic")
 	}
+	credential, err := resolveCredentials(opts, promptSecret)
+	if err != nil {
+		return err
+	}
 	client, err := redfish.NewClient(redfish.Config{
 		Endpoint:       opts.endpoint,
-		Username:       opts.username,
-		Password:       os.Getenv("REDFISH_PASSWORD"),
+		Username:       credential.Username,
+		Password:       credential.Password,
 		Insecure:       opts.insecure,
 		RequestTimeout: 30 * time.Second,
 	})
 	if err != nil {
 		return err
 	}
+	defer client.CloseIdleConnections()
 
 	ctx := context.Background()
 	switch command {
@@ -366,5 +392,5 @@ func printJSON(data []byte) error {
 }
 
 func usageError() error {
-	return fmt.Errorf("usage: redfish <discover|systems|get|syslog> --endpoint https://BMC [--username USER] [--insecure]\nredfish scan --target CIDR_OR_START-END --output inventory.yaml [--insecure]\nset REDFISH_PASSWORD (and optionally REDFISH_USERNAME); get takes a Redfish resource path")
+	return fmt.Errorf("usage: redfish <discover|systems|get|syslog> --endpoint https://BMC [--username USER] [--insecure]\nauthenticate with REDFISH_PASSWORD and REDFISH_USERNAME/--username, or --credentials-file FILE --credential-ref NAME\nredfish credentials set --file credentials.age --ref NAME --endpoint https://BMC --username USER [--replace]\nredfish scan --target CIDR_OR_START-END --output inventory.yaml [--failures-output failures.yaml] [--insecure]\nget takes a Redfish resource path")
 }
