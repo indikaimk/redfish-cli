@@ -1,6 +1,7 @@
 package redfish
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -100,6 +101,43 @@ func (c *Client) Get(ctx context.Context, resourcePath string) (json.RawMessage,
 		return nil, fmt.Errorf("GET %s returned invalid JSON", resourcePath)
 	}
 	return json.RawMessage(body), nil
+}
+
+func (c *Client) Patch(ctx context.Context, resourcePath string, body []byte) error {
+	resourceURL, err := c.resourceURL(resourcePath)
+	if err != nil {
+		return err
+	}
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodPatch, resourceURL.String(), bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	request.SetBasicAuth(c.username, c.password)
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Content-Type", "application/json")
+
+	response, err := c.http.Do(request)
+	if err != nil {
+		return fmt.Errorf("PATCH %s: %w", resourcePath, err)
+	}
+	defer response.Body.Close()
+
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, maxResponseSize+1))
+	if err != nil {
+		return fmt.Errorf("read response from %s: %w", resourcePath, err)
+	}
+	if len(responseBody) > maxResponseSize {
+		return fmt.Errorf("response from %s exceeds %d bytes", resourcePath, maxResponseSize)
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		detail := strings.TrimSpace(string(responseBody))
+		if len(detail) > 512 {
+			detail = detail[:512] + "..."
+		}
+		return fmt.Errorf("PATCH %s returned HTTP %s: %s", resourcePath, response.Status, detail)
+	}
+	return nil
 }
 
 func (c *Client) resourceURL(resourcePath string) (*url.URL, error) {

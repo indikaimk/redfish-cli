@@ -20,10 +20,27 @@ type options struct {
 	insecure bool
 }
 
+type syslogOptions struct {
+	manager              string
+	serverID             string
+	address              string
+	port                 int
+	logTypes             string
+	transmissionProtocol string
+	messageFormat        string
+	enable               bool
+	disable              bool
+	apply                bool
+}
+
 type collection struct {
 	Members *[]struct {
 		ODataID string `json:"@odata.id"`
 	} `json:"Members"`
+}
+
+type syslogService struct {
+	SyslogServers []map[string]json.RawMessage `json:"SyslogServers"`
 }
 
 type serviceRoot struct {
@@ -54,6 +71,28 @@ func run(args []string) error {
 
 	switch command {
 	case "discover", "systems":
+	case "syslog":
+		syslogOpts := syslogOptions{}
+		flags.StringVar(&syslogOpts.manager, "manager", "", "manager ID, for example Blade7 (required)")
+		flags.StringVar(&syslogOpts.serverID, "server", "0", "syslog server slot MemberId (0-3)")
+		flags.StringVar(&syslogOpts.address, "address", "", "syslog server hostname or IP address")
+		flags.IntVar(&syslogOpts.port, "port", 0, "syslog server port (1-65535)")
+		flags.StringVar(&syslogOpts.logTypes, "log-types", "", "comma-separated log types to forward")
+		flags.StringVar(&syslogOpts.transmissionProtocol, "protocol", "", "transmission protocol: UDP, TCP, or TLS")
+		flags.StringVar(&syslogOpts.messageFormat, "message-format", "", "message format: RFC3164, RFC5424, or Custom")
+		flags.BoolVar(&syslogOpts.enable, "enable", false, "enable the selected syslog server")
+		flags.BoolVar(&syslogOpts.disable, "disable", false, "disable the selected syslog server")
+		flags.BoolVar(&syslogOpts.apply, "apply", false, "apply the changes (default is dry-run)")
+		if err := flags.Parse(args[1:]); err != nil {
+			return err
+		}
+		if flags.NArg() != 0 {
+			return usageError()
+		}
+		if err := validateSyslogOptions(syslogOpts); err != nil {
+			return err
+		}
+		return execute(opts, command, "", syslogOpts)
 	case "get":
 		if err := flags.Parse(args[1:]); err != nil {
 			return err
@@ -61,7 +100,7 @@ func run(args []string) error {
 		if flags.NArg() != 1 {
 			return fmt.Errorf("get requires one resource path, such as /redfish/v1/Systems")
 		}
-		return execute(opts, command, flags.Arg(0))
+		return execute(opts, command, flags.Arg(0), syslogOptions{})
 	default:
 		return usageError()
 	}
@@ -72,10 +111,10 @@ func run(args []string) error {
 	if flags.NArg() != 0 {
 		return usageError()
 	}
-	return execute(opts, command, "")
+	return execute(opts, command, "", syslogOptions{})
 }
 
-func execute(opts options, command, resourcePath string) error {
+func execute(opts options, command, resourcePath string, syslogOpts syslogOptions) error {
 	if opts.endpoint == "" {
 		return fmt.Errorf("--endpoint is required")
 	}
@@ -109,9 +148,150 @@ func execute(opts options, command, resourcePath string) error {
 		return printJSON(data)
 	case "systems":
 		return printSystems(ctx, client)
+	case "syslog":
+		return executeSyslog(ctx, client, syslogOpts)
 	default:
 		return usageError()
 	}
+}
+
+func validateSyslogOptions(opts syslogOptions) error {
+	if opts.manager == "" || strings.IndexFunc(opts.manager, func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '-' || r == '_')
+	}) != -1 {
+		return fmt.Errorf("syslog requires a valid --manager ID, such as Blade7")
+	}
+	if len(opts.serverID) != 1 || opts.serverID < "0" || opts.serverID > "3" {
+		return fmt.Errorf("--server must be a slot from 0 to 3")
+	}
+	if opts.enable == opts.disable {
+		return fmt.Errorf("specify exactly one of --enable or --disable")
+	}
+	if opts.enable && (strings.TrimSpace(opts.address) == "" || opts.port < 1 || opts.port > 65535) {
+		return fmt.Errorf("--enable requires --address and --port from 1 to 65535")
+	}
+	if opts.disable && (opts.address != "" || opts.port != 0) {
+		return fmt.Errorf("--address and --port cannot be used with --disable")
+	}
+	if opts.transmissionProtocol != "" && !contains([]string{"UDP", "TCP", "TLS"}, opts.transmissionProtocol) {
+		return fmt.Errorf("--protocol must be UDP, TCP, or TLS")
+	}
+	if opts.messageFormat != "" && !contains([]string{"RFC3164", "RFC5424", "Custom"}, opts.messageFormat) {
+		return fmt.Errorf("--message-format must be RFC3164, RFC5424, or Custom")
+	}
+	if opts.logTypes != "" {
+		for _, logType := range strings.Split(opts.logTypes, ",") {
+			logType = strings.TrimSpace(logType)
+			if !contains([]string{"OperationLog", "SecurityLog", "EventLog"}, logType) {
+				return fmt.Errorf("unsupported log type %q; use OperationLog, SecurityLog, or EventLog", logType)
+			}
+		}
+	}
+	return nil
+}
+
+func executeSyslog(ctx context.Context, client *redfish.Client, opts syslogOptions) error {
+	resourcePath := "/redfish/v1/Managers/" + opts.manager + "/SyslogService"
+	data, err := client.Get(ctx, resourcePath)
+	if err != nil {
+		return err
+	}
+
+	var service syslogService
+	if err := json.Unmarshal(data, &service); err != nil {
+		return fmt.Errorf("decode syslog service: %w", err)
+	}
+	if service.SyslogServers == nil {
+		return fmt.Errorf("syslog service does not contain a SyslogServers array")
+	}
+
+	serverIndex := -1
+	for i := range service.SyslogServers {
+		var memberID string
+		if err := json.Unmarshal(service.SyslogServers[i]["MemberId"], &memberID); err != nil {
+			return fmt.Errorf("decode MemberId for syslog server slot %d: %w", i, err)
+		}
+		if memberID == opts.serverID {
+			serverIndex = i
+			break
+		}
+	}
+	if serverIndex == -1 {
+		return fmt.Errorf("syslog service does not contain server slot %s", opts.serverID)
+	}
+
+	server := service.SyslogServers[serverIndex]
+	if err := setSyslogField(server, "Enabled", opts.enable); err != nil {
+		return err
+	}
+	if opts.enable {
+		if err := setSyslogField(server, "Address", strings.TrimSpace(opts.address)); err != nil {
+			return err
+		}
+		if err := setSyslogField(server, "Port", opts.port); err != nil {
+			return err
+		}
+	}
+	if opts.logTypes != "" {
+		if err := setSyslogField(server, "LogType", splitLogTypes(opts.logTypes)); err != nil {
+			return err
+		}
+	}
+
+	payload := map[string]any{"SyslogServers": service.SyslogServers}
+	if opts.enable {
+		payload["ServiceEnabled"] = true
+	}
+	if opts.transmissionProtocol != "" {
+		payload["TransmissionProtocol"] = opts.transmissionProtocol
+	}
+	if opts.messageFormat != "" {
+		payload["MessageFormat"] = opts.messageFormat
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encode syslog configuration: %w", err)
+	}
+	if !opts.apply {
+		fmt.Fprintln(os.Stderr, "Dry run: no changes sent. Add --apply to apply this configuration.")
+		return printJSON(encoded)
+	}
+
+	if err := client.Patch(ctx, resourcePath, encoded); err != nil {
+		return err
+	}
+	updated, err := client.Get(ctx, resourcePath)
+	if err != nil {
+		return fmt.Errorf("configuration was patched but could not be verified: %w", err)
+	}
+	return printJSON(updated)
+}
+
+func setSyslogField(fields map[string]json.RawMessage, name string, value any) error {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("encode syslog field %s: %w", name, err)
+	}
+	fields[name] = encoded
+	return nil
+}
+
+func splitLogTypes(value string) []string {
+	items := strings.Split(value, ",")
+	for i := range items {
+		items[i] = strings.TrimSpace(items[i])
+	}
+	return items
+}
+
+func contains(values []string, value string) bool {
+	for _, candidate := range values {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
 }
 
 func printSystems(ctx context.Context, client *redfish.Client) error {
@@ -179,5 +359,5 @@ func printJSON(data []byte) error {
 }
 
 func usageError() error {
-	return fmt.Errorf("usage: redfish <discover|systems|get> --endpoint https://BMC [--username USER] [--insecure]\nset REDFISH_PASSWORD (and optionally REDFISH_USERNAME); get takes a Redfish resource path")
+	return fmt.Errorf("usage: redfish <discover|systems|get|syslog> --endpoint https://BMC [--username USER] [--insecure]\nset REDFISH_PASSWORD (and optionally REDFISH_USERNAME); get takes a Redfish resource path")
 }
