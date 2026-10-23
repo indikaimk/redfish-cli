@@ -28,6 +28,18 @@ type Config struct {
 	Password       string
 	Insecure       bool
 	RequestTimeout time.Duration
+	Anonymous      bool
+}
+
+type HTTPError struct {
+	StatusCode int
+	Path       string
+	Status     string
+	Detail     string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("GET %s returned HTTP %s: %s", e.Path, e.Status, e.Detail)
 }
 
 func NewClient(config Config) (*Client, error) {
@@ -42,7 +54,10 @@ func NewClient(config Config) (*Client, error) {
 		(endpoint.Path != "" && endpoint.Path != "/") {
 		return nil, fmt.Errorf("endpoint must contain only the server origin, without credentials, path, query, or fragment")
 	}
-	if config.Username == "" || config.Password == "" {
+	if config.Anonymous && (config.Username != "" || config.Password != "") {
+		return nil, fmt.Errorf("anonymous requests must not include credentials")
+	}
+	if !config.Anonymous && (config.Username == "" || config.Password == "") {
 		return nil, fmt.Errorf("username and password are required")
 	}
 	if config.RequestTimeout <= 0 {
@@ -69,6 +84,10 @@ func (c *Client) Get(ctx context.Context, resourcePath string) (json.RawMessage,
 	return body, err
 }
 
+func (c *Client) CloseIdleConnections() {
+	c.http.CloseIdleConnections()
+}
+
 func (c *Client) GetWithETag(ctx context.Context, resourcePath string) (json.RawMessage, string, error) {
 	resourceURL, err := c.resourceURL(resourcePath)
 	if err != nil {
@@ -79,7 +98,9 @@ func (c *Client) GetWithETag(ctx context.Context, resourcePath string) (json.Raw
 	if err != nil {
 		return nil, "", fmt.Errorf("create request: %w", err)
 	}
-	request.SetBasicAuth(c.username, c.password)
+	if c.username != "" {
+		request.SetBasicAuth(c.username, c.password)
+	}
 	request.Header.Set("Accept", "application/json")
 
 	response, err := c.http.Do(request)
@@ -100,7 +121,7 @@ func (c *Client) GetWithETag(ctx context.Context, resourcePath string) (json.Raw
 		if len(detail) > 512 {
 			detail = detail[:512] + "..."
 		}
-		return nil, "", fmt.Errorf("GET %s returned HTTP %s: %s", resourcePath, response.Status, detail)
+		return nil, "", &HTTPError{StatusCode: response.StatusCode, Path: resourcePath, Status: response.Status, Detail: detail}
 	}
 	if !json.Valid(body) {
 		return nil, "", fmt.Errorf("GET %s returned invalid JSON", resourcePath)
@@ -109,6 +130,9 @@ func (c *Client) GetWithETag(ctx context.Context, resourcePath string) (json.Raw
 }
 
 func (c *Client) Patch(ctx context.Context, resourcePath string, body []byte, etag string) error {
+	if c.username == "" {
+		return fmt.Errorf("PATCH requires an authenticated client")
+	}
 	resourceURL, err := c.resourceURL(resourcePath)
 	if err != nil {
 		return err

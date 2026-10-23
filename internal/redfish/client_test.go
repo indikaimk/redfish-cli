@@ -55,13 +55,25 @@ func TestNewClientRequiresOriginAndCredentials(t *testing.T) {
 		config Config
 	}{
 		{name: "missing credentials", config: Config{Endpoint: "https://192.0.2.10"}},
+		{name: "anonymous with credentials", config: Config{Endpoint: "https://192.0.2.10", Anonymous: true, Username: "u", Password: "p"}},
 		{name: "endpoint path", config: Config{Endpoint: "https://192.0.2.10/redfish/v1", Username: "u", Password: "p"}},
 	}
+
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			if _, err := NewClient(test.config); err == nil {
 				t.Fatal("expected invalid configuration to be rejected")
 			}
 		})
+	}
+}
+
+func TestAnonymousClientCannotPatch(t *testing.T) {
+	client, err := NewClient(Config{Endpoint: "https://192.0.2.10", Anonymous: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Patch(context.Background(), "/redfish/v1", []byte(`{}`), ""); err == nil {
+		t.Fatal("anonymous client must not PATCH")
 	}
 }

@@ -61,6 +61,9 @@ func run(args []string) error {
 	if len(args) == 0 {
 		return usageError()
 	}
+	if args[0] == "scan" {
+		return runScan(args[1:])
+	}
 
 	command := args[0]
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
@@ -363,5 +366,5 @@ func printJSON(data []byte) error {
 }
 
 func usageError() error {
-	return fmt.Errorf("usage: redfish <discover|systems|get|syslog> --endpoint https://BMC [--username USER] [--insecure]\nset REDFISH_PASSWORD (and optionally REDFISH_USERNAME); get takes a Redfish resource path")
+	return fmt.Errorf("usage: redfish <discover|systems|get|syslog> --endpoint https://BMC [--username USER] [--insecure]\nredfish scan --target CIDR_OR_START-END --output inventory.yaml [--insecure]\nset REDFISH_PASSWORD (and optionally REDFISH_USERNAME); get takes a Redfish resource path")
 }

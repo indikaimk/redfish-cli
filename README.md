@@ -7,7 +7,8 @@ every server or BMC firmware exposes the same optional resources.
 ## Requirements
 
 - Go 1.24 or later
-- A Huawei server/BMC reachable over HTTP(S) with a Redfish account
+- A Huawei server/BMC reachable over HTTP(S); authenticated commands require a
+  Redfish account, but `scan` is anonymous
 
 ## Build
 
@@ -62,6 +63,65 @@ redfish get --endpoint https://192.0.2.10 /redfish/v1/Chassis
 - `discover` prints the Redfish service root and its advertised links.
 - `systems` reads the Systems collection and then each advertised system.
 - `get` reads any absolute Redfish resource path on the configured controller.
+
+### Scan a subnet or IP range into a YAML inventory
+
+Scan only networks you are authorized to access. `scan` makes an anonymous
+HTTPS GET to `/redfish/v1` on port 443 for each target. It does not use
+`REDFISH_USERNAME` or `REDFISH_PASSWORD`, even when they are set, and it makes no
+configuration changes.
+
+```powershell
+.\redfish.exe scan --target 10.174.89.0/24 --output inventory.yaml --insecure
+```
+
+Or use an inclusive start-end IPv4 range:
+
+```powershell
+.\redfish.exe scan --target 10.174.89.16-10.174.89.50 `
+  --output inventory-range.yaml --insecure
+```
+
+TLS verification is enabled unless `--insecure` is supplied. Discovery reads
+`UUID` and `Oem.Huawei.ProductName` directly from the service root; it does not
+query protected manager or system resources or guess blade IDs.
+
+Example inventory:
+
+```yaml
+version: 1
+hosts:
+  - ip: "10.174.89.16"
+    endpoint: "https://10.174.89.16"
+    status: "discovered"
+    uuid: "5FCA285B-0488-B3E0-E911-9335CE76F877"
+    product_name: "CH121 V5"
+failures:
+  - ip: "10.174.89.17"
+    endpoint: "https://10.174.89.17"
+    status: "authentication_required"
+    error: "GET /redfish/v1 returned HTTP 401 Unauthorized: "
+```
+
+- Limits: at most 1024 addresses, 8 concurrent hosts, and 5 seconds per request.
+  Larger ranges/subnets are rejected before any requests are sent.
+- CIDRs are normalized to their subnet. Network and broadcast addresses are
+  excluded for `/30` and larger subnets; `/31` and `/32` include every address.
+  Explicit ranges include both endpoints.
+- Only validated Redfish service roots appear under `hosts`. Missing UUID or
+  ProductName is recorded as an empty string and reported on stderr.
+- Other results appear under `failures`, with a diagnostic: authentication
+  required (401), forbidden (403), HTTP errors, certificate errors, connection
+  errors, timeouts, invalid responses, or cancelled requests. A connection error
+  or timeout does not prove the IP is unused; the HTTPS endpoint may be filtered.
+- Output is ordered by IP and contains no credentials. Existing inventory files
+  are never overwritten; choose a new filename for subsequent scans.
+- Per-host failures do not stop the scan. Completion reports counts on stderr;
+  output-file errors and interruption return an error. Ctrl+C saves results
+  collected so far and records cancelled targets.
+
+This inventory is for discovery only; bulk syslog configuration from YAML is
+not implemented yet.
 
 ### Configure syslog forwarding
 
